@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -c \"import requests; print\\(''ok''\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scraper.py)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -c \":*)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe server.py)",
+      "Bash(curl -s http://127.0.0.1:8080/api/articles)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scraper.py 1)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''total:'''', d[''''total'''']\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scraper.py 2)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scraper.py list 1)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scraper.py status)",
+      "Bash(rm -f \"d:/Projects/jiqizhixin-scraper/data/pJMG8ZXFLd.jsonl\")",
+      "Bash(rm -rf \"d:/Projects/jiqizhixin-scraper/data/images\")"
+    ]
+  }
+}
