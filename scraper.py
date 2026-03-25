@@ -171,6 +171,13 @@ def save_queue_items(queue_path, items):
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
+def remove_from_queue(queue_path, url):
+    """从队列文件中移除指定 URL 的条目。每次重新读取文件，不会丢失 fetch 新追加的数据。"""
+    items = load_queue_items(queue_path)
+    items = [it for it in items if it.get("original_url") != url]
+    save_queue_items(queue_path, items)
+
+
 def append_queue_items(queue_path, items):
     """追加条目到队列文件"""
     with open(queue_path, "a", encoding="utf-8") as f:
@@ -539,84 +546,100 @@ def cmd_scrape(slug=SLUG):
     """
     从队列文件读取待爬取文章，逐篇爬取微信正文 + 下载图片，
     完成后从队列中移除。
+
+    采用循环读取模式：每轮处理完当前队列后，重新读取队列文件，
+    如果 fetch 追加了新数据则继续处理，直到队列真正为空。
     """
     queue_path = get_queue_path(slug)
     output_path = get_output_path(slug)
-
-    queue_items = load_queue_items(queue_path)
-    if not queue_items:
-        log.info("队列为空，没有待爬取的文章。先运行 fetch 获取文章列表。")
-        return
-
-    # 再次检查主数据文件去重（可能上次 scrape 中途退出，队列未清理）
     existing_urls = load_existing_urls(output_path)
 
-    log.info(f"队列中 {len(queue_items)} 条待爬取")
-    log.info(f"主数据文件已有 {len(existing_urls)} 条")
-
     consecutive_fail = 0
-    processed = 0
+    total_processed = 0
 
-    for i, item in enumerate(queue_items, 1):
-        url = item.get("original_url", "")
-        title = item.get("name") or item.get("title", "无标题")
-
-        if url in existing_urls:
-            log.debug(f"[{i}/{len(queue_items)}] 跳过（已完成）: {title[:50]}")
-            processed += 1
-            continue
-
-        art_id = article_id(url)
-        content_html = ""
-        local_cover = ""
-
-        log.info(f"[{i}/{len(queue_items)}] 爬取: {title[:50]}")
-        try:
-            content_html = scrape_wechat_content(url)
-            if content_html:
-                log.info(f"  -> 正文 OK ({len(content_html)} chars)")
-                consecutive_fail = 0
-
-                cover_url = item.get("image", "")
-                log.info(f"  -> 下载图片...")
-                content_html, local_cover, img_down, img_fail = \
-                    download_article_images(content_html, cover_url, slug, art_id)
-                log.info(f"  -> 图片: {img_down} 下载, {img_fail} 失败")
+    while True:
+        # 每轮重新读取队列，拿到 fetch 可能新追加的数据
+        queue_items = load_queue_items(queue_path)
+        if not queue_items:
+            if total_processed == 0:
+                log.info("队列为空，没有待爬取的文章。先运行 fetch 获取文章列表。")
             else:
-                log.warning(f"  -> 正文为空（页面可能需要验证或已被删除）")
-                consecutive_fail += 1
-        except requests.exceptions.HTTPError as e:
-            log.error(f"  -> HTTP 错误: {e}")
-            consecutive_fail += 1
-        except requests.exceptions.RequestException as e:
-            log.error(f"  -> 网络错误: {e}")
-            consecutive_fail += 1
-        except Exception as e:
-            log.error(f"  -> 未知错误: {e}")
-            consecutive_fail += 1
-
-        if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
-            log.error(f"连续 {consecutive_fail} 次爬取失败，可能被限流，中止")
+                log.info("队列已清空，本轮结束。")
             break
 
-        # 保存到主数据文件
-        record = build_record(item, content_html, local_cover, slug, art_id)
-        append_record(output_path, record)
-        existing_urls.add(url)
-        processed += 1
+        log.info(f"队列中 {len(queue_items)} 条待爬取，主数据文件已有 {len(existing_urls)} 条")
 
-        # 每处理一篇就更新队列文件（移除已处理的）
-        remaining = queue_items[i:]  # i 是从 1 开始的，所以 queue_items[i:] 就是剩余
-        save_queue_items(queue_path, remaining)
+        round_processed = 0
 
-        # 不是最后一篇时等待随机间隔
-        if i < len(queue_items):
+        for i, item in enumerate(queue_items, 1):
+            url = item.get("original_url", "")
+            title = item.get("name") or item.get("title", "无标题")
+
+            # 已完成的直接从队列移除
+            if url in existing_urls:
+                log.debug(f"[{i}/{len(queue_items)}] 跳过（已完成）: {title[:50]}")
+                remove_from_queue(queue_path, url)
+                continue
+
+            art_id = article_id(url)
+            content_html = ""
+            local_cover = ""
+
+            log.info(f"[{i}/{len(queue_items)}] 爬取: {title[:50]}")
+            try:
+                content_html = scrape_wechat_content(url)
+                if content_html:
+                    log.info(f"  -> 正文 OK ({len(content_html)} chars)")
+                    consecutive_fail = 0
+
+                    cover_url = item.get("image", "")
+                    log.info(f"  -> 下载图片...")
+                    content_html, local_cover, img_down, img_fail = \
+                        download_article_images(content_html, cover_url, slug, art_id)
+                    log.info(f"  -> 图片: {img_down} 下载, {img_fail} 失败")
+                else:
+                    log.warning(f"  -> 正文为空（页面可能需要验证或已被删除）")
+                    consecutive_fail += 1
+            except requests.exceptions.HTTPError as e:
+                log.error(f"  -> HTTP 错误: {e}")
+                consecutive_fail += 1
+            except requests.exceptions.RequestException as e:
+                log.error(f"  -> 网络错误: {e}")
+                consecutive_fail += 1
+            except Exception as e:
+                log.error(f"  -> 未知错误: {e}")
+                consecutive_fail += 1
+
+            if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
+                log.error(f"连续 {consecutive_fail} 次爬取失败，可能被限流，中止")
+                break
+
+            # 保存到主数据文件
+            record = build_record(item, content_html, local_cover, slug, art_id)
+            append_record(output_path, record)
+            existing_urls.add(url)
+            total_processed += 1
+            round_processed += 1
+
+            # 从队列移除这一条（重新读取文件，不会丢失 fetch 新追加的）
+            remove_from_queue(queue_path, url)
+
             sleep_random()
 
-    # 最终状态
+        # 连续失败过多则退出外层循环
+        if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
+            break
+
+        # 本轮没有处理任何新文章（全是跳过），直接结束
+        if round_processed == 0:
+            break
+
+        # 本轮处理完了，回到 while 顶部重新读取队列，看 fetch 有没有追加新的
+        log.info(f"本轮处理 {round_processed} 条，检查队列是否有新数据...")
+
     remaining = load_queue_items(queue_path)
     log.info("=" * 40)
-    log.info(f"[scrape] 本次处理: {processed} 条")
+    log.info(f"[scrape] 本次共处理: {total_processed} 条")
     log.info(f"[scrape] 队列剩余: {len(remaining)} 条")
     log.info(f"[scrape] 主数据文件: {len(existing_urls)} 条")
 
