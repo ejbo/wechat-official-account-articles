@@ -49,9 +49,9 @@ python server.py
 ```python
 SLUG = "pJMG8ZXFLd"       # 专栏标识，切换专栏时修改这里
 PAGE_SIZE = 30             # 每页条数，最大 30
-API_INTERVAL = 3           # API 翻页间隔（秒）
+API_INTERVAL = 2           # API 翻页间隔（秒）
 SCRAPE_MIN_INTERVAL = 3    # 爬取文章最小间隔（秒）
-SCRAPE_MAX_INTERVAL = 6    # 爬取文章最大间隔（秒）
+SCRAPE_MAX_INTERVAL = 3    # 爬取文章最大间隔（秒）
 IMG_DOWNLOAD_INTERVAL = 0.5 # 图片下载间隔（秒）
 MAX_CONSECUTIVE_FAILURES = 5 # 连续失败次数上限，超过自动中止
 ```

@@ -1,12 +1,16 @@
 """
 今天看啥 (jintiankansha) 专栏文章抓取器
 
-两步抓取:
-  1. 通过 API 获取文章列表（含 original_url），page_size=30
-  2. 逐个访问 original_url 爬取微信公众号文章正文 HTML
-  3. 下载正文及封面图片到本地，HTML 中图片链接替换为本地路径
+两阶段解耦架构:
+  fetch  — 从今天看啥 API 获取文章列表，存入队列文件（快，仅元数据）
+  scrape — 从队列文件读取待处理文章，爬取微信公众号正文 + 下载图片（慢）
 
-存储格式: JSON Lines (.jsonl) + 本地图片目录
+两个命令可同时运行：fetch 不断拉取新数据，scrape 同时消费队列爬取正文。
+
+存储格式:
+  {slug}_queue.jsonl  — 待爬取队列（API 元数据）
+  {slug}.jsonl        — 完整数据（含正文 HTML + 本地图片路径）
+  images/{slug}/      — 本地图片目录
 """
 
 import hashlib
@@ -77,6 +81,11 @@ def get_output_path(slug):
     return os.path.join(OUTPUT_DIR, f"{slug}.jsonl")
 
 
+def get_queue_path(slug):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, f"{slug}_queue.jsonl")
+
+
 def get_progress_path(slug):
     return os.path.join(OUTPUT_DIR, f"{slug}_progress.json")
 
@@ -108,25 +117,60 @@ def load_existing_urls(filepath):
     return urls
 
 
+def load_queue_urls(queue_path):
+    """读取队列文件中所有 original_url，用于去重"""
+    urls = set()
+    if not os.path.exists(queue_path):
+        return urls
+    with open(queue_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                url = item.get("original_url")
+                if url:
+                    urls.add(url)
+            except json.JSONDecodeError:
+                continue
+    return urls
+
+
+def load_queue_items(queue_path):
+    """读取队列文件中所有条目"""
+    items = []
+    if not os.path.exists(queue_path):
+        return items
+    with open(queue_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return items
+
+
+def save_queue_items(queue_path, items):
+    """将条目列表写回队列文件（覆盖）"""
+    with open(queue_path, "w", encoding="utf-8") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def append_queue_items(queue_path, items):
+    """追加条目到队列文件"""
+    with open(queue_path, "a", encoding="utf-8") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
 # ========== 进度管理 ==========
 
 def load_progress(slug):
-    """
-    加载进度文件，返回 dict:
-    {
-        "slug": "...",
-        "last_completed_page": 3,
-        "next_page": 4,
-        "total_articles": 90,
-        "last_updated": "...",
-        "stop_reason": "user_interrupt / api_limit / completed / ...",
-        "pages": {
-            "1": {"status": "done", "new": 28, "skip": 2, "time": "..."},
-            "2": {"status": "done", ...},
-            "3": {"status": "partial", "new": 15, "skip": 0, "time": "..."},
-        }
-    }
-    """
     path = get_progress_path(slug)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -186,7 +230,6 @@ def sleep_random():
 
 def guess_ext(url, content_type=""):
     """从 URL 或 Content-Type 猜测图片扩展名"""
-    # 从 Content-Type
     ct = content_type.lower()
     if "png" in ct:
         return ".png"
@@ -199,7 +242,6 @@ def guess_ext(url, content_type=""):
     if "jpeg" in ct or "jpg" in ct:
         return ".jpg"
 
-    # 从 URL 参数 wx_fmt=
     m = re.search(r'wx_fmt=(\w+)', url)
     if m:
         fmt = m.group(1).lower()
@@ -208,13 +250,12 @@ def guess_ext(url, content_type=""):
         if fmt in ("jpeg", "jpg"):
             return ".jpg"
 
-    # 从路径
     path = urlparse(url).path.lower()
     for ext in (".png", ".gif", ".webp", ".svg", ".jpg", ".jpeg"):
         if path.endswith(ext):
             return ext
 
-    return ".jpg"  # 默认
+    return ".jpg"
 
 
 def download_image(url, save_path):
@@ -223,7 +264,6 @@ def download_image(url, save_path):
         resp = requests.get(url, headers=IMG_HEADERS, timeout=15, stream=True)
         resp.raise_for_status()
         ct = resp.headers.get("Content-Type", "")
-        # 如果 save_path 没有扩展名，根据响应补上
         if not os.path.splitext(save_path)[1]:
             save_path += guess_ext(url, ct)
         with open(save_path, "wb") as f:
@@ -241,7 +281,6 @@ def download_article_images(content_html, cover_url, slug, art_id):
     返回 (修改后的 html, 本地封面路径, 下载数, 失败数)
     """
     img_dir = get_image_dir(slug, art_id)
-    # 本地路径前缀（相对于 server 根目录，供前端引用）
     url_prefix = f"/data/images/{slug}/{art_id}"
 
     downloaded = 0
@@ -261,7 +300,7 @@ def download_article_images(content_html, cover_url, slug, art_id):
                 time.sleep(IMG_DOWNLOAD_INTERVAL)
             else:
                 failed += 1
-                local_cover = cover_url  # 回退用原始 URL
+                local_cover = cover_url
         else:
             local_cover = f"{url_prefix}/{cover_filename}"
 
@@ -271,7 +310,6 @@ def download_article_images(content_html, cover_url, slug, art_id):
     for match in img_pattern.finditer(content_html):
         img_urls.append(match.group(3))
 
-    # 去重但保持顺序
     seen = set()
     unique_urls = []
     for u in img_urls:
@@ -279,7 +317,6 @@ def download_article_images(content_html, cover_url, slug, art_id):
             seen.add(u)
             unique_urls.append(u)
 
-    # 建立 URL -> 本地路径 的映射
     url_map = {}
     for idx, img_url in enumerate(unique_urls, 1):
         ext = guess_ext(img_url)
@@ -296,7 +333,7 @@ def download_article_images(content_html, cover_url, slug, art_id):
             url_map[img_url] = f"{url_prefix}/{os.path.basename(local_path)}"
         else:
             failed += 1
-            url_map[img_url] = img_url  # 回退
+            url_map[img_url] = img_url
 
         if idx < len(unique_urls):
             time.sleep(IMG_DOWNLOAD_INTERVAL)
@@ -304,12 +341,10 @@ def download_article_images(content_html, cover_url, slug, art_id):
     # 3. 替换 HTML 中的图片链接
     def replace_img(match):
         prefix = match.group(1)
-        attr = match.group(2)   # data-src 或 src
+        attr = match.group(2)
         orig_url = match.group(3)
         local_url = url_map.get(orig_url, orig_url)
-        # 统一用 src，去掉 data-src
         if attr == "data-src":
-            # 先移除已有的 src=""（如果有）
             prefix = re.sub(r'\ssrc="[^"]*"', '', prefix)
             return f'{prefix}src="{local_url}"'
         return f'{prefix}src="{local_url}"'
@@ -390,129 +425,31 @@ def append_record(filepath, record):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def scrape_and_save_page(items, filepath, existing_urls, slug, scrape=True):
+# ========== fetch: 仅从 API 获取元数据，存入队列 ==========
+
+def cmd_fetch(slug=SLUG, start_page=None):
     """
-    处理一页的文章列表：去重、爬取正文、下载图片、保存。
-    返回 (new_count, skip_count)。
+    从今天看啥 API 翻页获取文章列表，存入队列文件。
+    只做 API 调用 + 去重 + 写入队列，不爬取微信正文。
     """
-    new_count = 0
-    skip_count = 0
-    consecutive_fail = 0
-
-    for i, item in enumerate(items, 1):
-        url = item.get("original_url", "")
-        title = item.get("name") or item.get("title", "无标题")
-
-        if url in existing_urls:
-            log.debug(f"[{i}/{len(items)}] 跳过（已存在）: {title[:50]}")
-            skip_count += 1
-            continue
-
-        art_id = article_id(url)
-        content_html = ""
-        local_cover = ""
-        img_down = 0
-        img_fail = 0
-
-        if scrape and url:
-            log.info(f"[{i}/{len(items)}] 爬取: {title[:50]}")
-            try:
-                content_html = scrape_wechat_content(url)
-                if content_html:
-                    log.info(f"  -> 正文 OK ({len(content_html)} chars)")
-                    consecutive_fail = 0
-
-                    # 下载图片
-                    cover_url = item.get("image", "")
-                    log.info(f"  -> 下载图片...")
-                    content_html, local_cover, img_down, img_fail = \
-                        download_article_images(content_html, cover_url, slug, art_id)
-                    log.info(f"  -> 图片: {img_down} 下载, {img_fail} 失败")
-                else:
-                    log.warning(f"  -> 正文为空（页面可能需要验证或已被删除）")
-                    consecutive_fail += 1
-            except requests.exceptions.HTTPError as e:
-                log.error(f"  -> HTTP 错误: {e}")
-                consecutive_fail += 1
-            except requests.exceptions.RequestException as e:
-                log.error(f"  -> 网络错误: {e}")
-                consecutive_fail += 1
-            except Exception as e:
-                log.error(f"  -> 未知错误: {e}")
-                consecutive_fail += 1
-
-            if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
-                log.error(f"连续 {consecutive_fail} 次爬取失败，可能被限流，中止本轮")
-                raise ScrapeFatalError(f"连续 {consecutive_fail} 次失败")
-
-            # 不是最后一篇时等待随机间隔
-            if i < len(items):
-                sleep_random()
-        else:
-            log.info(f"[{i}/{len(items)}] 仅保存元信息: {title[:50]}")
-
-        record = build_record(item, content_html, local_cover, slug, art_id)
-        append_record(filepath, record)
-        existing_urls.add(url)
-        new_count += 1
-
-    return new_count, skip_count
-
-
-def fetch_single_page(slug=SLUG, page=1, scrape=True):
-    """抓取单页文章列表 + 爬取正文"""
-    filepath = get_output_path(slug)
-    existing_urls = load_existing_urls(filepath)
+    queue_path = get_queue_path(slug)
+    output_path = get_output_path(slug)
     progress = load_progress(slug)
 
-    log.info(f"数据文件: {filepath}（已有 {len(existing_urls)} 条）")
-    print_progress_summary(progress)
-    log.info(f"请求第 {page} 页（page_size={PAGE_SIZE}）...")
+    # 去重：已在主数据文件中的 + 已在队列中的
+    existing_urls = load_existing_urls(output_path)
+    queue_urls = load_queue_urls(queue_path)
+    known_urls = existing_urls | queue_urls
 
-    try:
-        items = fetch_article_list(slug, page)
-    except APILimitReached as e:
-        log.error(f"API 受限: {e}")
-        progress["stop_reason"] = "api_limit"
-        save_progress(progress)
-        return
-    log.info(f"获取到 {len(items)} 篇文章")
-
-    if not items:
-        log.warning("本页无数据")
-        return
-
-    try:
-        new_count, skip_count = scrape_and_save_page(items, filepath, existing_urls, slug, scrape)
-        update_page_progress(progress, page, "done", new_count, skip_count)
-        progress["stop_reason"] = "page_done"
-    except ScrapeFatalError:
-        log.error("爬取中止，已保存的数据不受影响")
-        update_page_progress(progress, page, "partial", new_count, skip_count)
-        progress["stop_reason"] = "scrape_failure"
-
-    save_progress(progress)
-    log.info(f"本页完成: 新增 {new_count} 条，跳过 {skip_count} 条重复")
-    log.info(f"进度已保存到 {get_progress_path(slug)}")
-
-
-def fetch_all_pages(slug=SLUG, start_page=None):
-    """自动翻页抓取。start_page=None 时自动从上次断点继续。"""
-    filepath = get_output_path(slug)
-    existing_urls = load_existing_urls(filepath)
-    progress = load_progress(slug)
-
-    log.info(f"数据文件: {filepath}（已有 {len(existing_urls)} 条）")
+    log.info(f"队列文件: {queue_path}（已有 {len(queue_urls)} 条待爬取）")
+    log.info(f"主数据文件: {output_path}（已有 {len(existing_urls)} 条已完成）")
     print_progress_summary(progress)
 
-    # 自动续接：未指定起始页时，从进度文件的 next_page 继续
     if start_page is None:
         start_page = progress.get("next_page", 1)
         log.info(f"自动续接，从第 {start_page} 页开始")
     else:
         log.info(f"手动指定，从第 {start_page} 页开始")
-
-    log.info(f"page_size={PAGE_SIZE}")
 
     page = start_page
     total_new = 0
@@ -538,24 +475,22 @@ def fetch_all_pages(slug=SLUG, start_page=None):
             stop_reason = "completed"
             break
 
-        log.info(f"本页 {len(items)} 篇文章")
+        # 过滤已存在的
+        new_items = [it for it in items if it.get("original_url", "") not in known_urls]
+        page_skip = len(items) - len(new_items)
 
-        try:
-            page_new, page_skip = scrape_and_save_page(items, filepath, existing_urls, slug)
-            update_page_progress(progress, page, "done", page_new, page_skip)
-        except ScrapeFatalError:
-            log.error("爬取连续失败，中止。已保存的数据不受影响。")
-            update_page_progress(progress, page, "partial", 0, 0)
-            stop_reason = "scrape_failure"
-            save_progress(progress)
-            break
+        if new_items:
+            append_queue_items(queue_path, new_items)
+            for it in new_items:
+                known_urls.add(it.get("original_url", ""))
 
+        page_new = len(new_items)
         total_new += page_new
         total_skip += page_skip
-        log.info(f"本页结果: 新增 {page_new}, 跳过 {page_skip}")
-        log.info(f"累计: 新增 {total_new}, 跳过 {total_skip}")
 
-        # 每页完成后立即保存进度（断电也不丢）
+        log.info(f"本页 {len(items)} 篇: 新增 {page_new} 到队列, 跳过 {page_skip} (已存在)")
+
+        update_page_progress(progress, page, "done", page_new, page_skip)
         save_progress(progress)
 
         if page_new == 0:
@@ -580,32 +515,235 @@ def fetch_all_pages(slug=SLUG, start_page=None):
     save_progress(progress)
 
     log.info("=" * 40)
-    log.info(f"本次运行: 新增 {total_new} 条, 跳过 {total_skip} 条")
-    log.info(f"停止原因: {stop_reason}")
+    log.info(f"[fetch] 本次: 新增 {total_new} 条到队列, 跳过 {total_skip} 条")
+    log.info(f"[fetch] 停止原因: {stop_reason}")
+
+    # 打印当前队列状态
+    current_queue = load_queue_items(queue_path)
+    log.info(f"[fetch] 队列中共 {len(current_queue)} 条待爬取")
+
+
+# ========== scrape: 从队列读取，爬取微信正文 ==========
+
+def cmd_scrape(slug=SLUG):
+    """
+    从队列文件读取待爬取文章，逐篇爬取微信正文 + 下载图片，
+    完成后从队列中移除。
+    """
+    queue_path = get_queue_path(slug)
+    output_path = get_output_path(slug)
+
+    queue_items = load_queue_items(queue_path)
+    if not queue_items:
+        log.info("队列为空，没有待爬取的文章。先运行 fetch 获取文章列表。")
+        return
+
+    # 再次检查主数据文件去重（可能上次 scrape 中途退出，队列未清理）
+    existing_urls = load_existing_urls(output_path)
+
+    log.info(f"队列中 {len(queue_items)} 条待爬取")
+    log.info(f"主数据文件已有 {len(existing_urls)} 条")
+
+    consecutive_fail = 0
+    processed = 0
+
+    for i, item in enumerate(queue_items, 1):
+        url = item.get("original_url", "")
+        title = item.get("name") or item.get("title", "无标题")
+
+        if url in existing_urls:
+            log.debug(f"[{i}/{len(queue_items)}] 跳过（已完成）: {title[:50]}")
+            processed += 1
+            continue
+
+        art_id = article_id(url)
+        content_html = ""
+        local_cover = ""
+
+        log.info(f"[{i}/{len(queue_items)}] 爬取: {title[:50]}")
+        try:
+            content_html = scrape_wechat_content(url)
+            if content_html:
+                log.info(f"  -> 正文 OK ({len(content_html)} chars)")
+                consecutive_fail = 0
+
+                cover_url = item.get("image", "")
+                log.info(f"  -> 下载图片...")
+                content_html, local_cover, img_down, img_fail = \
+                    download_article_images(content_html, cover_url, slug, art_id)
+                log.info(f"  -> 图片: {img_down} 下载, {img_fail} 失败")
+            else:
+                log.warning(f"  -> 正文为空（页面可能需要验证或已被删除）")
+                consecutive_fail += 1
+        except requests.exceptions.HTTPError as e:
+            log.error(f"  -> HTTP 错误: {e}")
+            consecutive_fail += 1
+        except requests.exceptions.RequestException as e:
+            log.error(f"  -> 网络错误: {e}")
+            consecutive_fail += 1
+        except Exception as e:
+            log.error(f"  -> 未知错误: {e}")
+            consecutive_fail += 1
+
+        if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
+            log.error(f"连续 {consecutive_fail} 次爬取失败，可能被限流，中止")
+            break
+
+        # 保存到主数据文件
+        record = build_record(item, content_html, local_cover, slug, art_id)
+        append_record(output_path, record)
+        existing_urls.add(url)
+        processed += 1
+
+        # 每处理一篇就更新队列文件（移除已处理的）
+        remaining = queue_items[i:]  # i 是从 1 开始的，所以 queue_items[i:] 就是剩余
+        save_queue_items(queue_path, remaining)
+
+        # 不是最后一篇时等待随机间隔
+        if i < len(queue_items):
+            sleep_random()
+
+    # 最终状态
+    remaining = load_queue_items(queue_path)
+    log.info("=" * 40)
+    log.info(f"[scrape] 本次处理: {processed} 条")
+    log.info(f"[scrape] 队列剩余: {len(remaining)} 条")
+    log.info(f"[scrape] 主数据文件: {len(existing_urls)} 条")
+
+
+# ========== 兼容旧命令 ==========
+
+def scrape_and_save_page(items, filepath, existing_urls, slug, scrape=True):
+    """
+    处理一页的文章列表：去重、爬取正文、下载图片、保存。
+    返回 (new_count, skip_count)。
+    """
+    new_count = 0
+    skip_count = 0
+    consecutive_fail = 0
+
+    for i, item in enumerate(items, 1):
+        url = item.get("original_url", "")
+        title = item.get("name") or item.get("title", "无标题")
+
+        if url in existing_urls:
+            log.debug(f"[{i}/{len(items)}] 跳过（已存在）: {title[:50]}")
+            skip_count += 1
+            continue
+
+        art_id = article_id(url)
+        content_html = ""
+        local_cover = ""
+
+        if scrape and url:
+            log.info(f"[{i}/{len(items)}] 爬取: {title[:50]}")
+            try:
+                content_html = scrape_wechat_content(url)
+                if content_html:
+                    log.info(f"  -> 正文 OK ({len(content_html)} chars)")
+                    consecutive_fail = 0
+
+                    cover_url = item.get("image", "")
+                    log.info(f"  -> 下载图片...")
+                    content_html, local_cover, img_down, img_fail = \
+                        download_article_images(content_html, cover_url, slug, art_id)
+                    log.info(f"  -> 图片: {img_down} 下载, {img_fail} 失败")
+                else:
+                    log.warning(f"  -> 正文为空（页面可能需要验证或已被删除）")
+                    consecutive_fail += 1
+            except requests.exceptions.HTTPError as e:
+                log.error(f"  -> HTTP 错误: {e}")
+                consecutive_fail += 1
+            except requests.exceptions.RequestException as e:
+                log.error(f"  -> 网络错误: {e}")
+                consecutive_fail += 1
+            except Exception as e:
+                log.error(f"  -> 未知错误: {e}")
+                consecutive_fail += 1
+
+            if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
+                log.error(f"连续 {consecutive_fail} 次爬取失败，可能被限流，中止本轮")
+                raise ScrapeFatalError(f"连续 {consecutive_fail} 次失败")
+
+            if i < len(items):
+                sleep_random()
+        else:
+            log.info(f"[{i}/{len(items)}] 仅保存元信息: {title[:50]}")
+
+        record = build_record(item, content_html, local_cover, slug, art_id)
+        append_record(filepath, record)
+        existing_urls.add(url)
+        new_count += 1
+
+    return new_count, skip_count
+
+
+def fetch_single_page(slug=SLUG, page=1, scrape=True):
+    """抓取单页文章列表 + 爬取正文（旧的一体化模式）"""
+    filepath = get_output_path(slug)
+    existing_urls = load_existing_urls(filepath)
+    progress = load_progress(slug)
+
+    log.info(f"数据文件: {filepath}（已有 {len(existing_urls)} 条）")
     print_progress_summary(progress)
+    log.info(f"请求第 {page} 页（page_size={PAGE_SIZE}）...")
+
+    try:
+        items = fetch_article_list(slug, page)
+    except APILimitReached as e:
+        log.error(f"API 受限: {e}")
+        progress["stop_reason"] = "api_limit"
+        save_progress(progress)
+        return
+    log.info(f"获取到 {len(items)} 篇文章")
+
+    if not items:
+        log.warning("本页无数据")
+        return
+
+    new_count = 0
+    skip_count = 0
+    try:
+        new_count, skip_count = scrape_and_save_page(items, filepath, existing_urls, slug, scrape)
+        update_page_progress(progress, page, "done", new_count, skip_count)
+        progress["stop_reason"] = "page_done"
+    except ScrapeFatalError:
+        log.error("爬取中止，已保存的数据不受影响")
+        update_page_progress(progress, page, "partial", new_count, skip_count)
+        progress["stop_reason"] = "scrape_failure"
+
+    save_progress(progress)
+    log.info(f"本页完成: 新增 {new_count} 条，跳过 {skip_count} 条重复")
     log.info(f"进度已保存到 {get_progress_path(slug)}")
 
 
 if __name__ == "__main__":
     usage = """用法:
-  python scraper.py              抓取第1页（测试）
-  python scraper.py 3            抓取第3页
-  python scraper.py all          自动续接上次断点继续翻页抓取
-  python scraper.py all 5        从第5页开始自动翻页抓取
-  python scraper.py list 2       仅获取第2页列表（不爬正文）
-  python scraper.py status       查看当前抓取进度"""
+  python scraper.py fetch          从 API 获取文章列表存入队列（可持续运行）
+  python scraper.py fetch 5        从第 5 页开始获取
+  python scraper.py scrape         从队列读取并爬取微信正文（可与 fetch 同时运行）
+  python scraper.py status         查看当前进度和队列状态
+  python scraper.py                抓取第1页（一体化模式，测试用）
+  python scraper.py 3              抓取第3页（一体化模式）
+  python scraper.py list 2         仅获取第2页列表（不爬正文）"""
 
     if len(sys.argv) < 2:
         fetch_single_page(page=1)
-    elif sys.argv[1] == "all":
+    elif sys.argv[1] == "fetch":
         start = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
-        fetch_all_pages(start_page=start)
+        cmd_fetch(start_page=start)
+    elif sys.argv[1] == "scrape":
+        cmd_scrape()
     elif sys.argv[1] == "list":
         page = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 1
         fetch_single_page(page=page, scrape=False)
     elif sys.argv[1] == "status":
         progress = load_progress(SLUG)
         print_progress_summary(progress)
+        # 队列状态
+        queue_path = get_queue_path(SLUG)
+        queue_items = load_queue_items(queue_path)
+        log.info(f"待爬取队列: {len(queue_items)} 条")
         if progress["pages"]:
             log.info("--- 各页详情 ---")
             for p in sorted(progress["pages"].keys(), key=int):
