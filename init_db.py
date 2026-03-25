@@ -10,6 +10,7 @@
   python init_db.py                    仅建表
   python init_db.py migrate            建表 + 迁移现有数据
   python init_db.py migrate --images   建表 + 迁移数据 + 导入图片（耗时较长）
+  python init_db.py backfill           为已有文章生成 content_text 纯文本
 """
 
 import json
@@ -157,5 +158,11 @@ if __name__ == "__main__":
             print("将导入文章数据（不含图片）...")
             print("如需同时导入图片，请使用: python init_db.py migrate --images")
         migrate_articles(db, import_images=import_images)
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "backfill":
+        from database import backfill_content_text
+        print("开始回填 content_text（HTML → 纯文本）...")
+        total = backfill_content_text(db)
+        print(f"完成，共回填 {total} 篇文章的 content_text")
 
     db.close()

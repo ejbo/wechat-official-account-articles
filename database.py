@@ -6,15 +6,41 @@ PostgreSQL 数据库层 — 建表、连接管理、CRUD 操作
 """
 
 import logging
+import re
 import time
 
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+from bs4 import BeautifulSoup
 
 from db_config import DB_CONFIG, POOL_MIN_CONN, POOL_MAX_CONN, RETRY_MAX_ATTEMPTS, RETRY_DELAY_SECONDS
 
 log = logging.getLogger("database")
+
+
+def html_to_text(html):
+    """
+    将微信文章 HTML 提炼为干净的纯文本，供模型训练使用。
+    去除所有标签、多余空白、脚本/样式，保留段落换行。
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    # 删除 script / style
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    # 在块级元素前后插入换行，保留段落结构
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    for tag in soup.find_all(["p", "div", "section", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote"]):
+        tag.insert_before("\n")
+        tag.insert_after("\n")
+    text = soup.get_text()
+    # 清理：合并连续空白行，去掉行首尾空格
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]  # 去空行
+    return "\n".join(lines)
 
 # ==================== 建表 SQL ====================
 
@@ -243,17 +269,19 @@ def get_existing_urls(db, source_id):
 
 def insert_article(db, source_id, article_hash, title, author, publish_time,
                    original_url, cover_url, content_html, is_first, fetched_at):
+    content_text = html_to_text(content_html)
+
     def _do(conn):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO articles
                     (source_id, article_hash, title, author, publish_time,
-                     original_url, cover_url, content_html, is_first, fetched_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     original_url, cover_url, content_html, content_text, is_first, fetched_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (original_url) DO NOTHING
                 RETURNING id
             """, (source_id, article_hash, title, author, publish_time,
-                  original_url, cover_url, content_html, is_first, fetched_at))
+                  original_url, cover_url, content_html, content_text, is_first, fetched_at))
             row = cur.fetchone()
             return row[0] if row else None
     return db.execute_with_retry(_do)
@@ -478,3 +506,36 @@ def get_article_count_by_source(db):
             """)
             return {row[0]: row[1] for row in cur.fetchall()}
     return db.execute_with_retry(_do)
+
+
+def backfill_content_text(db, batch_size=100):
+    """
+    回填已有文章的 content_text（对 content_text 为空但 content_html 非空的记录）。
+    用于数据库中已有数据但 content_text 尚未生成的情况。
+    """
+    total = 0
+    while True:
+        def _fetch(conn):
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, content_html FROM articles
+                    WHERE content_text = '' AND content_html != ''
+                    LIMIT %s
+                """, (batch_size,))
+                return cur.fetchall()
+
+        rows = db.execute_with_retry(_fetch)
+        if not rows:
+            break
+
+        for article_id, content_html in rows:
+            text = html_to_text(content_html)
+            def _update(conn, aid=article_id, txt=text):
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE articles SET content_text = %s WHERE id = %s", (txt, aid))
+            db.execute_with_retry(_update)
+            total += 1
+
+        log.info(f"已回填 {total} 篇 content_text")
+
+    return total
