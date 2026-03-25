@@ -16,6 +16,7 @@
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -25,11 +26,20 @@ from urllib.parse import urlparse
 
 import requests
 from datetime import datetime
+from dotenv import load_dotenv
 
-# ============ 配置区域 ============
-SLUG = "pJMG8ZXFLd"  # 专栏标识，需要时修改这里
-USER = "jzl19991121@gmail.com"
-TOKEN = "Kb3ijGo95y"
+# 加载 .env 文件
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+# 是否使用数据库模式（命令行加 --db 启用）
+USE_DB = "--db" in sys.argv
+if "--db" in sys.argv:
+    sys.argv.remove("--db")
+
+# ============ 配置区域（从 .env 读取） ============
+SLUG = os.getenv("JTKSHA_SLUG", "pJMG8ZXFLd")
+USER = os.getenv("JTKSHA_USER", "")
+TOKEN = os.getenv("JTKSHA_TOKEN", "")
 API_URL = "http://www.jintiankansha.me/api3/query/adv/get_topics_by_one_column"
 PAGE_SIZE = 30  # 每页条数，最大30
 API_INTERVAL = 3  # API 翻页间隔（秒）
@@ -740,6 +750,307 @@ def fetch_single_page(slug=SLUG, page=1, scrape=True):
     log.info(f"进度已保存到 {get_progress_path(slug)}")
 
 
+# ========== 数据库模式 (--db) ==========
+
+def _init_db():
+    """初始化数据库连接，返回 (db, source)"""
+    from database import Database, get_or_create_source
+    db = Database()
+    db.connect()
+    db.init_schema()
+    source = get_or_create_source(db, SLUG, name="机器之心", platform="wechat")
+    return db, source
+
+
+def _guess_mime(url, ext):
+    """根据扩展名猜测 MIME 类型"""
+    mapping = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".gif": "image/gif",
+        ".webp": "image/webp", ".svg": "image/svg+xml",
+    }
+    return mapping.get(ext, "image/jpeg")
+
+
+def download_image_bytes(url):
+    """下载图片，返回 (bytes, ext, mime) 或 (None, None, None)"""
+    try:
+        resp = requests.get(url, headers=IMG_HEADERS, timeout=15, stream=True)
+        resp.raise_for_status()
+        ct = resp.headers.get("Content-Type", "")
+        ext = guess_ext(url, ct)
+        data = resp.content
+        mime = _guess_mime(url, ext)
+        return data, ext, mime
+    except Exception as e:
+        log.debug(f"    图片下载失败: {str(e)[:80]}")
+        return None, None, None
+
+
+def db_cmd_fetch(slug=SLUG, start_page=None):
+    """数据库模式的 fetch：从 API 获取文章列表存入 scrape_queue 表"""
+    from database import (get_or_create_source, get_existing_urls, get_progress,
+                          update_progress, enqueue_articles, count_queue, Database)
+
+    db, source = _init_db()
+    source_id = source["id"]
+
+    existing_urls = get_existing_urls(db, source_id)
+    pending_count = count_queue(db, source_id, "pending")
+    progress = get_progress(db, source_id)
+
+    log.info(f"数据库已有 {len(existing_urls)} 篇文章，队列中 {pending_count} 条待爬取")
+    log.info(f"已完成到第 {progress['last_completed_page']} 页")
+
+    if start_page is None:
+        start_page = progress.get("next_page", 1)
+        log.info(f"自动续接，从第 {start_page} 页开始")
+
+    page = start_page
+    total_new = 0
+    total_skip = 0
+    consecutive_all_exist = 0
+    stop_reason = "completed"
+    page_details = progress.get("page_details") or {}
+
+    while True:
+        log.info(f"========== 第 {page} 页 ==========")
+        try:
+            items = fetch_article_list(slug, page)
+        except APILimitReached as e:
+            log.error(f"API 受限，停止翻页: {e}")
+            stop_reason = "api_limit"
+            break
+        except requests.exceptions.RequestException as e:
+            log.error(f"API 请求失败，停止翻页: {e}")
+            stop_reason = "network_error"
+            break
+
+        if not items:
+            log.info("本页无数据，已到末尾。")
+            stop_reason = "completed"
+            break
+
+        # 过滤已在文章表中的
+        new_items = [it for it in items if it.get("original_url", "") not in existing_urls]
+        page_skip = len(items) - len(new_items)
+
+        # 入队（enqueue_articles 内部会去重已在队列中的）
+        page_new = enqueue_articles(db, source_id, new_items)
+        for it in new_items:
+            existing_urls.add(it.get("original_url", ""))
+
+        total_new += page_new
+        total_skip += page_skip
+
+        log.info(f"本页 {len(items)} 篇: 新增 {page_new} 到队列, 跳过 {page_skip} (已存在)")
+
+        page_details[str(page)] = {
+            "status": "done", "new": page_new, "skip": page_skip,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        completed_page = max(progress.get("last_completed_page", 0), page)
+        update_progress(db, source_id,
+                        last_completed_page=completed_page,
+                        next_page=completed_page + 1,
+                        page_details=page_details)
+
+        if page_new == 0 and page_skip == len(items):
+            consecutive_all_exist += 1
+            if consecutive_all_exist >= 2:
+                log.info("连续 2 页全为已有数据，停止。")
+                stop_reason = "all_exist"
+                break
+        else:
+            consecutive_all_exist = 0
+
+        if len(items) < PAGE_SIZE:
+            log.info("本页不足 PAGE_SIZE，已到最后一页。")
+            stop_reason = "completed"
+            break
+
+        page += 1
+        log.info(f"翻页等待 {API_INTERVAL}s...")
+        time.sleep(API_INTERVAL)
+
+    update_progress(db, source_id, stop_reason=stop_reason)
+    log.info("=" * 40)
+    log.info(f"[fetch-db] 本次: 新增 {total_new} 条到队列, 跳过 {total_skip} 条")
+    log.info(f"[fetch-db] 停止原因: {stop_reason}")
+    pending = count_queue(db, source_id, "pending")
+    log.info(f"[fetch-db] 队列中共 {pending} 条待爬取")
+    db.close()
+
+
+def db_cmd_scrape(slug=SLUG):
+    """数据库模式的 scrape：从 scrape_queue 读取，爬取正文+图片存入数据库"""
+    from database import (get_pending_queue, update_queue_status,
+                          insert_article, insert_image, count_queue,
+                          count_articles, Database)
+
+    db, source = _init_db()
+    source_id = source["id"]
+
+    pending = count_queue(db, source_id, "pending")
+    if pending == 0:
+        log.info("队列为空，没有待爬取的文章。先运行 fetch --db 获取文章列表。")
+        db.close()
+        return
+
+    log.info(f"队列中 {pending} 条待爬取")
+    consecutive_fail = 0
+    processed = 0
+    batch_size = 50
+
+    while True:
+        items = get_pending_queue(db, source_id, limit=batch_size)
+        if not items:
+            break
+
+        for i, item in enumerate(items, 1):
+            url = item["original_url"]
+            title = item["title"] or "无标题"
+            queue_id = item["id"]
+
+            art_hash = article_id(url)
+            content_html = ""
+
+            log.info(f"[{processed + 1}] 爬取: {title[:50]}")
+            update_queue_status(db, queue_id, "processing")
+
+            try:
+                content_html = scrape_wechat_content(url)
+                if content_html:
+                    log.info(f"  -> 正文 OK ({len(content_html)} chars)")
+                    consecutive_fail = 0
+                else:
+                    log.warning(f"  -> 正文为空")
+                    consecutive_fail += 1
+            except requests.exceptions.HTTPError as e:
+                log.error(f"  -> HTTP 错误: {e}")
+                consecutive_fail += 1
+            except requests.exceptions.RequestException as e:
+                log.error(f"  -> 网络错误: {e}")
+                consecutive_fail += 1
+            except Exception as e:
+                log.error(f"  -> 未知错误: {e}")
+                consecutive_fail += 1
+
+            if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
+                log.error(f"连续 {consecutive_fail} 次爬取失败，可能被限流，中止")
+                update_queue_status(db, queue_id, "failed")
+                break
+
+            # 插入文章
+            db_article_id = insert_article(
+                db, source_id, art_hash,
+                title=title,
+                author=item.get("author", ""),
+                publish_time=item.get("publish_time", ""),
+                original_url=url,
+                cover_url=item.get("cover_url", ""),
+                content_html=content_html,
+                is_first=item.get("is_first", 0),
+                fetched_at=datetime.now(),
+            )
+
+            if db_article_id and content_html:
+                # 下载并存储封面图
+                cover_url = item.get("cover_url", "")
+                img_down = 0
+                img_fail = 0
+
+                if cover_url:
+                    data, ext, mime = download_image_bytes(cover_url)
+                    if data:
+                        insert_image(db, db_article_id, "cover", 0,
+                                     cover_url, f"cover{ext}", mime, data)
+                        img_down += 1
+                        time.sleep(IMG_DOWNLOAD_INTERVAL)
+                    else:
+                        img_fail += 1
+
+                # 下载正文图片
+                img_pattern = re.compile(r'(<img[^>]*?)(data-src|src)="([^"]+)"', re.IGNORECASE)
+                seen = set()
+                idx = 0
+                new_html = content_html
+
+                for match in img_pattern.finditer(content_html):
+                    img_url = match.group(3)
+                    if img_url in seen:
+                        continue
+                    seen.add(img_url)
+                    idx += 1
+
+                    data, ext, mime = download_image_bytes(img_url)
+                    if data:
+                        filename = f"{idx}{ext}"
+                        img_id = insert_image(db, db_article_id, "content", idx,
+                                              img_url, filename, mime, data)
+                        # 替换 HTML 中的链接为 API 路径
+                        local_path = f"/api/images/{img_id}"
+                        new_html = new_html.replace(img_url, local_path)
+                        img_down += 1
+                        time.sleep(IMG_DOWNLOAD_INTERVAL)
+                    else:
+                        img_fail += 1
+
+                # 更新文章的 content_html（图片链接已替换）
+                if img_down > 0:
+                    def _update_html(conn):
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE articles SET content_html = %s WHERE id = %s",
+                                (new_html, db_article_id)
+                            )
+                    db.execute_with_retry(_update_html)
+
+                log.info(f"  -> 图片: {img_down} 下载, {img_fail} 失败")
+
+            update_queue_status(db, queue_id, "done")
+            processed += 1
+
+            if i < len(items):
+                sleep_random()
+
+        if consecutive_fail >= MAX_CONSECUTIVE_FAILURES:
+            break
+
+    total_articles = count_articles(db, source_id)
+    remaining = count_queue(db, source_id, "pending")
+    log.info("=" * 40)
+    log.info(f"[scrape-db] 本次处理: {processed} 条")
+    log.info(f"[scrape-db] 队列剩余: {remaining} 条")
+    log.info(f"[scrape-db] 数据库文章总数: {total_articles} 条")
+    db.close()
+
+
+def db_cmd_status(slug=SLUG):
+    """数据库模式的 status"""
+    from database import (get_progress, count_queue, count_articles, Database)
+
+    db, source = _init_db()
+    source_id = source["id"]
+
+    progress = get_progress(db, source_id)
+    total = count_articles(db, source_id)
+    pending = count_queue(db, source_id, "pending")
+    done = count_queue(db, source_id, "done")
+    failed = count_queue(db, source_id, "failed")
+
+    log.info(f"专栏: {slug} (source_id={source_id})")
+    log.info(f"已完成到第 {progress['last_completed_page']} 页，下次从第 {progress['next_page']} 页开始")
+    log.info(f"数据库文章总数: {total}")
+    log.info(f"队列: 待爬取={pending}, 已完成={done}, 失败={failed}")
+    if progress.get("stop_reason"):
+        log.info(f"上次停止原因: {progress['stop_reason']}")
+
+    db.close()
+
+
+# ========== 入口 ==========
+
 if __name__ == "__main__":
     usage = """用法:
   python scraper.py fetch          从 API 获取文章列表存入队列（可持续运行）
@@ -748,31 +1059,50 @@ if __name__ == "__main__":
   python scraper.py status         查看当前进度和队列状态
   python scraper.py                抓取第1页（一体化模式，测试用）
   python scraper.py 3              抓取第3页（一体化模式）
-  python scraper.py list 2         仅获取第2页列表（不爬正文）"""
+  python scraper.py list 2         仅获取第2页列表（不爬正文）
 
-    if len(sys.argv) < 2:
-        fetch_single_page(page=1)
-    elif sys.argv[1] == "fetch":
-        start = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
-        cmd_fetch(start_page=start)
-    elif sys.argv[1] == "scrape":
-        cmd_scrape()
-    elif sys.argv[1] == "list":
-        page = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 1
-        fetch_single_page(page=page, scrape=False)
-    elif sys.argv[1] == "status":
-        progress = load_progress(SLUG)
-        print_progress_summary(progress)
-        # 队列状态
-        queue_path = get_queue_path(SLUG)
-        queue_items = load_queue_items(queue_path)
-        log.info(f"待爬取队列: {len(queue_items)} 条")
-        if progress["pages"]:
-            log.info("--- 各页详情 ---")
-            for p in sorted(progress["pages"].keys(), key=int):
-                info = progress["pages"][p]
-                log.info(f"  第 {p} 页: {info['status']}  新增={info['new']}  跳过={info['skip']}  时间={info['time']}")
-    elif sys.argv[1].isdigit():
-        fetch_single_page(page=int(sys.argv[1]))
+  加 --db 参数启用数据库模式:
+  python scraper.py --db fetch     文章列表存入 PostgreSQL
+  python scraper.py --db scrape    从数据库队列爬取，正文+图片存入数据库
+  python scraper.py --db status    查看数据库中的进度"""
+
+    if USE_DB:
+        # 数据库模式
+        if len(sys.argv) < 2:
+            print(usage)
+        elif sys.argv[1] == "fetch":
+            start = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
+            db_cmd_fetch(start_page=start)
+        elif sys.argv[1] == "scrape":
+            db_cmd_scrape()
+        elif sys.argv[1] == "status":
+            db_cmd_status()
+        else:
+            print(usage)
     else:
-        print(usage)
+        # 文件模式（原有逻辑）
+        if len(sys.argv) < 2:
+            fetch_single_page(page=1)
+        elif sys.argv[1] == "fetch":
+            start = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
+            cmd_fetch(start_page=start)
+        elif sys.argv[1] == "scrape":
+            cmd_scrape()
+        elif sys.argv[1] == "list":
+            page = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 1
+            fetch_single_page(page=page, scrape=False)
+        elif sys.argv[1] == "status":
+            progress = load_progress(SLUG)
+            print_progress_summary(progress)
+            queue_path = get_queue_path(SLUG)
+            queue_items = load_queue_items(queue_path)
+            log.info(f"待爬取队列: {len(queue_items)} 条")
+            if progress["pages"]:
+                log.info("--- 各页详情 ---")
+                for p in sorted(progress["pages"].keys(), key=int):
+                    info = progress["pages"][p]
+                    log.info(f"  第 {p} 页: {info['status']}  新增={info['new']}  跳过={info['skip']}  时间={info['time']}")
+        elif sys.argv[1].isdigit():
+            fetch_single_page(page=int(sys.argv[1]))
+        else:
+            print(usage)
