@@ -8,6 +8,7 @@ PostgreSQL 数据库层 — 建表、连接管理、CRUD 操作
 import logging
 import re
 import time
+from datetime import datetime
 
 import psycopg2
 import psycopg2.extras
@@ -63,12 +64,11 @@ CREATE TABLE IF NOT EXISTS articles (
     article_hash    VARCHAR(32)  NOT NULL,               -- md5(original_url)[:10] 兼容现有 article_id
     title           VARCHAR(512) NOT NULL DEFAULT '',
     author          VARCHAR(255) NOT NULL DEFAULT '',
-    publish_time    VARCHAR(32)  NOT NULL DEFAULT '',     -- 原始格式 "20260324093032"
+    publish_time    TIMESTAMP,                            -- 文章发布时间
     original_url    TEXT         NOT NULL,                -- 微信原文链接
     cover_url       TEXT         NOT NULL DEFAULT '',     -- 远程封面 URL
     content_html    TEXT         NOT NULL DEFAULT '',     -- 正文 HTML（图片链接已替换为本地）
     content_text    TEXT         NOT NULL DEFAULT '',     -- 纯文本正文（供模型训练）
-    is_first        SMALLINT     NOT NULL DEFAULT 0,
     fetched_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
     created_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
@@ -129,6 +129,47 @@ CREATE TABLE IF NOT EXISTS scrape_progress (
 
     CONSTRAINT uq_progress_source UNIQUE (source_id)
 );
+"""
+
+# 对已存在的旧表做结构迁移（幂等）
+MIGRATION_SQL = """
+DO $$
+BEGIN
+    -- 1. articles: 删除 is_first（如果存在）
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'articles' AND column_name = 'is_first'
+    ) THEN
+        ALTER TABLE articles DROP COLUMN is_first;
+    END IF;
+
+    -- 2. articles: publish_time VARCHAR → TIMESTAMP（如果还是字符串类型）
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'articles' AND column_name = 'publish_time'
+          AND data_type IN ('character varying', 'text')
+    ) THEN
+        ALTER TABLE articles ALTER COLUMN publish_time DROP NOT NULL;
+        ALTER TABLE articles ALTER COLUMN publish_time DROP DEFAULT;
+        ALTER TABLE articles ALTER COLUMN publish_time TYPE TIMESTAMP
+            USING CASE
+                WHEN publish_time ~ '^[0-9]{14}$'
+                    THEN to_timestamp(publish_time, 'YYYYMMDDHH24MISS')
+                ELSE NULL
+            END;
+    END IF;
+
+    -- 3. scrape_queue: 删除 is_first（如果存在）
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'scrape_queue' AND column_name = 'is_first'
+    ) THEN
+        ALTER TABLE scrape_queue DROP COLUMN is_first;
+    END IF;
+END $$;
 """
 
 
@@ -222,12 +263,36 @@ class Database:
         raise last_err
 
     def init_schema(self):
-        """创建所有表（幂等）"""
+        """创建所有表并执行结构迁移（幂等）"""
         def _do(conn):
             with conn.cursor() as cur:
                 cur.execute(SCHEMA_SQL)
+                cur.execute(MIGRATION_SQL)
             log.info("数据库表结构已就绪")
         self.execute_with_retry(_do)
+
+
+# ==================== 工具函数 ====================
+
+def parse_publish_time(raw):
+    """
+    将 API 返回的发布时间字符串解析为 datetime。
+    支持 '20260324093032'（14位数字）及 ISO 格式。
+    无法解析时返回 None。
+    """
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if len(raw) == 14 and raw.isdigit():
+        try:
+            return datetime.strptime(raw, "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        pass
+    return None
 
 
 # ==================== 数据操作 ====================
@@ -240,6 +305,14 @@ def get_or_create_source(db, slug, name="", platform="wechat"):
             cur.execute("SELECT * FROM sources WHERE slug = %s", (slug,))
             row = cur.fetchone()
             if row:
+                # 名字有变化时同步更新
+                if name and row["name"] != name:
+                    cur.execute(
+                        "UPDATE sources SET name = %s, updated_at = NOW() WHERE slug = %s",
+                        (name, slug)
+                    )
+                    row = dict(row)
+                    row["name"] = name
                 return dict(row)
             cur.execute(
                 "INSERT INTO sources (slug, name, platform) VALUES (%s, %s, %s) RETURNING *",
@@ -268,20 +341,21 @@ def get_existing_urls(db, source_id):
 
 
 def insert_article(db, source_id, article_hash, title, author, publish_time,
-                   original_url, cover_url, content_html, is_first, fetched_at):
+                   original_url, cover_url, content_html, fetched_at):
     content_text = html_to_text(content_html)
+    parsed_time = parse_publish_time(publish_time)
 
     def _do(conn):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO articles
                     (source_id, article_hash, title, author, publish_time,
-                     original_url, cover_url, content_html, content_text, is_first, fetched_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     original_url, cover_url, content_html, content_text, fetched_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (original_url) DO NOTHING
                 RETURNING id
-            """, (source_id, article_hash, title, author, publish_time,
-                  original_url, cover_url, content_html, content_text, is_first, fetched_at))
+            """, (source_id, article_hash, title, author, parsed_time,
+                  original_url, cover_url, content_html, content_text, fetched_at))
             row = cur.fetchone()
             return row[0] if row else None
     return db.execute_with_retry(_do)

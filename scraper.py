@@ -36,17 +36,26 @@ USE_DB = "--db" in sys.argv
 if "--db" in sys.argv:
     sys.argv.remove("--db")
 
-# ============ 配置区域（从 .env 读取） ============
-SLUG = os.getenv("JTKSHA_SLUG", "pJMG8ZXFLd")
+# ============ 专栏配置 ============
+# slug        : 今天看啥的专栏标识
+# name        : 公众号名称（写入 sources 表，方便展示）
+# pages_per_run: 每次运行最多消耗的 API 翻页次数（额度保护）
+SOURCES = {
+    "pJMG8ZXFLd": {"name": "机器之心", "pages_per_run": 10},
+    # "another_slug": {"name": "另一公众号", "pages_per_run": 5},
+}
+# 单 slug 兼容旧命令（取第一个，或从 .env 指定）
+SLUG = os.getenv("JTKSHA_SLUG", next(iter(SOURCES)))
+
 USER = os.getenv("JTKSHA_USER", "")
 TOKEN = os.getenv("JTKSHA_TOKEN", "")
 API_URL = "http://www.jintiankansha.me/api3/query/adv/get_topics_by_one_column"
-PAGE_SIZE = 30  # 每页条数，最大30
-API_INTERVAL = 3  # API 翻页间隔（秒）
-SCRAPE_MIN_INTERVAL = 3  # 爬取文章最小间隔（秒）
-SCRAPE_MAX_INTERVAL = 6  # 爬取文章最大间隔（秒）
-IMG_DOWNLOAD_INTERVAL = 0.5  # 图片下载间隔（秒），比文章短，因为是静态资源
-MAX_CONSECUTIVE_FAILURES = 5  # 连续失败次数上限，超过则中止
+PAGE_SIZE = 30          # 每页条数，最大30
+API_INTERVAL = 3        # API 翻页间隔（秒）
+SCRAPE_MIN_INTERVAL = 3
+SCRAPE_MAX_INTERVAL = 6
+IMG_DOWNLOAD_INTERVAL = 0.5
+MAX_CONSECUTIVE_FAILURES = 5
 OUTPUT_DIR = "data"
 # =================================
 
@@ -752,13 +761,16 @@ def fetch_single_page(slug=SLUG, page=1, scrape=True):
 
 # ========== 数据库模式 (--db) ==========
 
-def _init_db():
+def _init_db(slug=None):
     """初始化数据库连接，返回 (db, source)"""
     from database import Database, get_or_create_source
+    if slug is None:
+        slug = SLUG
+    name = SOURCES.get(slug, {}).get("name", slug)
     db = Database()
     db.connect()
     db.init_schema()
-    source = get_or_create_source(db, SLUG, name="机器之心", platform="wechat")
+    source = get_or_create_source(db, slug, name=name, platform="wechat")
     return db, source
 
 
@@ -788,25 +800,38 @@ def download_image_bytes(url):
 
 
 def db_cmd_fetch(slug=SLUG, start_page=None):
-    """数据库模式的 fetch：从 API 获取文章列表存入 scrape_queue 表"""
+    """
+    数据库模式的 fetch：从 API 获取文章列表存入 scrape_queue 表。
+
+    额度保护：每个 slug 在 SOURCES 里配置 pages_per_run，限制单次 API 调用次数。
+
+    Gap 检测逻辑：
+      - 遇到连续 2 页全为已有数据时，检查下一页是否曾经抓过（在 page_details 里）。
+      - 若下一页从未抓过 → 可能存在历史缺口，继续探查（不计入 consecutive_all_exist）。
+      - 若下一页已抓过且也是全已有 → 说明后续是连续已知区域，安全停止。
+    """
     from database import (get_or_create_source, get_existing_urls, get_progress,
                           update_progress, enqueue_articles, count_queue, Database)
 
-    db, source = _init_db()
+    db, source = _init_db(slug)
     source_id = source["id"]
+    max_pages = SOURCES.get(slug, {}).get("pages_per_run", 10)
 
     existing_urls = get_existing_urls(db, source_id)
     pending_count = count_queue(db, source_id, "pending")
     progress = get_progress(db, source_id)
 
-    log.info(f"数据库已有 {len(existing_urls)} 篇文章，队列中 {pending_count} 条待爬取")
-    log.info(f"已完成到第 {progress['last_completed_page']} 页")
+    log.info(f"[{slug}] 数据库已有 {len(existing_urls)} 篇，队列 {pending_count} 条待爬取，本次额度 {max_pages} 页")
+    log.info(f"[{slug}] 已完成到第 {progress['last_completed_page']} 页")
 
     if start_page is None:
-        start_page = progress.get("next_page", 1)
-        log.info(f"自动续接，从第 {start_page} 页开始")
+        start_page = 1  # 每次从最新开始，确保不遗漏新文章
+        log.info(f"[{slug}] 从第 1 页（最新）开始")
+    else:
+        log.info(f"[{slug}] 手动指定从第 {start_page} 页开始")
 
     page = start_page
+    pages_fetched = 0       # 本次实际消耗的 API 次数
     total_new = 0
     total_skip = 0
     consecutive_all_exist = 0
@@ -814,7 +839,12 @@ def db_cmd_fetch(slug=SLUG, start_page=None):
     page_details = progress.get("page_details") or {}
 
     while True:
-        log.info(f"========== 第 {page} 页 ==========")
+        if pages_fetched >= max_pages:
+            log.info(f"[{slug}] 已达本次额度上限 {max_pages} 页，停止（剩余页留下次继续）")
+            stop_reason = "page_limit"
+            break
+
+        log.info(f"========== [{slug}] 第 {page} 页 ==========")
         try:
             items = fetch_article_list(slug, page)
         except APILimitReached as e:
@@ -826,6 +856,8 @@ def db_cmd_fetch(slug=SLUG, start_page=None):
             stop_reason = "network_error"
             break
 
+        pages_fetched += 1
+
         if not items:
             log.info("本页无数据，已到末尾。")
             stop_reason = "completed"
@@ -834,15 +866,12 @@ def db_cmd_fetch(slug=SLUG, start_page=None):
         # 过滤已在文章表中的
         new_items = [it for it in items if it.get("original_url", "") not in existing_urls]
         page_skip = len(items) - len(new_items)
-
-        # 入队（enqueue_articles 内部会去重已在队列中的）
         page_new = enqueue_articles(db, source_id, new_items)
         for it in new_items:
             existing_urls.add(it.get("original_url", ""))
 
         total_new += page_new
         total_skip += page_skip
-
         log.info(f"本页 {len(items)} 篇: 新增 {page_new} 到队列, 跳过 {page_skip} (已存在)")
 
         page_details[str(page)] = {
@@ -855,12 +884,20 @@ def db_cmd_fetch(slug=SLUG, start_page=None):
                         next_page=completed_page + 1,
                         page_details=page_details)
 
-        if page_new == 0 and page_skip == len(items):
+        if page_new == 0:
             consecutive_all_exist += 1
             if consecutive_all_exist >= 2:
-                log.info("连续 2 页全为已有数据，停止。")
-                stop_reason = "all_exist"
-                break
+                # 检查下一页是否曾经抓过
+                next_page_str = str(page + 1)
+                if next_page_str in page_details:
+                    # 下一页已知 → 后续是连续已知区域，可以安全停止
+                    log.info(f"[{slug}] 连续 {consecutive_all_exist} 页全为已有数据且后续页已知，停止")
+                    stop_reason = "all_exist"
+                    break
+                else:
+                    # 下一页从未抓过 → 可能存在历史缺口，继续探查
+                    log.info(f"[{slug}] 连续 {consecutive_all_exist} 页全为已有，但第 {page+1} 页未曾抓取，继续探查缺口...")
+                    consecutive_all_exist = 0
         else:
             consecutive_all_exist = 0
 
@@ -875,10 +912,10 @@ def db_cmd_fetch(slug=SLUG, start_page=None):
 
     update_progress(db, source_id, stop_reason=stop_reason)
     log.info("=" * 40)
-    log.info(f"[fetch-db] 本次: 新增 {total_new} 条到队列, 跳过 {total_skip} 条")
-    log.info(f"[fetch-db] 停止原因: {stop_reason}")
+    log.info(f"[{slug}] fetch 完成: 消耗 {pages_fetched} 次 API，新增 {total_new} 条，跳过 {total_skip} 条")
+    log.info(f"[{slug}] 停止原因: {stop_reason}")
     pending = count_queue(db, source_id, "pending")
-    log.info(f"[fetch-db] 队列中共 {pending} 条待爬取")
+    log.info(f"[{slug}] 队列中共 {pending} 条待爬取")
     db.close()
 
 
@@ -888,7 +925,7 @@ def db_cmd_scrape(slug=SLUG):
                           insert_article, insert_image, count_queue,
                           count_articles, Database)
 
-    db, source = _init_db()
+    db, source = _init_db(slug)
     source_id = source["id"]
 
     pending = count_queue(db, source_id, "pending")
@@ -950,7 +987,6 @@ def db_cmd_scrape(slug=SLUG):
                 original_url=url,
                 cover_url=item.get("cover_url", ""),
                 content_html=content_html,
-                is_first=item.get("is_first", 0),
                 fetched_at=datetime.now(),
             )
 
@@ -1030,7 +1066,7 @@ def db_cmd_status(slug=SLUG):
     """数据库模式的 status"""
     from database import (get_progress, count_queue, count_articles, Database)
 
-    db, source = _init_db()
+    db, source = _init_db(slug)
     source_id = source["id"]
 
     progress = get_progress(db, source_id)
@@ -1062,21 +1098,51 @@ if __name__ == "__main__":
   python scraper.py list 2         仅获取第2页列表（不爬正文）
 
   加 --db 参数启用数据库模式:
-  python scraper.py --db fetch     文章列表存入 PostgreSQL
-  python scraper.py --db scrape    从数据库队列爬取，正文+图片存入数据库
-  python scraper.py --db status    查看数据库中的进度"""
+  python scraper.py --db fetch              遍历 SOURCES 所有 slug，每个按 pages_per_run 限额抓取
+  python scraper.py --db fetch pJMG8ZXFLd  仅抓取指定 slug
+  python scraper.py --db scrape             从数据库队列爬取，正文+图片存入数据库
+  python scraper.py --db scrape pJMG8ZXFLd 仅爬取指定 slug
+  python scraper.py --db status             查看所有 slug 的进度
+  python scraper.py --db status pJMG8ZXFLd 查看指定 slug 的进度
+
+  多 slug 管理（在 scraper.py 顶部 SOURCES 字典中添加）:
+  SOURCES = {
+      "pJMG8ZXFLd": {"name": "机器之心", "pages_per_run": 10},
+      "another_slug": {"name": "另一公众号", "pages_per_run": 5},
+  }"""
 
     if USE_DB:
         # 数据库模式
+        # 判断是否指定了 slug 参数（非数字的第二个参数视为 slug）
+        def _get_slug_arg(pos=2):
+            if len(sys.argv) > pos and not sys.argv[pos].isdigit() and sys.argv[pos] != "all":
+                return sys.argv[pos]
+            return None
+
         if len(sys.argv) < 2:
             print(usage)
         elif sys.argv[1] == "fetch":
-            start = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else None
-            db_cmd_fetch(start_page=start)
+            target_slug = _get_slug_arg(2)
+            # 起始页：最后一个纯数字参数
+            start = next((int(a) for a in reversed(sys.argv[2:]) if a.isdigit()), None)
+            if target_slug:
+                db_cmd_fetch(slug=target_slug, start_page=start)
+            else:
+                # 遍历 SOURCES 中所有 slug
+                for s in SOURCES:
+                    db_cmd_fetch(slug=s, start_page=start)
         elif sys.argv[1] == "scrape":
-            db_cmd_scrape()
+            target_slug = _get_slug_arg(2)
+            if target_slug:
+                db_cmd_scrape(slug=target_slug)
+            else:
+                for s in SOURCES:
+                    db_cmd_scrape(slug=s)
         elif sys.argv[1] == "status":
-            db_cmd_status()
+            target_slug = _get_slug_arg(2)
+            slugs = [target_slug] if target_slug else list(SOURCES.keys())
+            for s in slugs:
+                db_cmd_status(slug=s)
         else:
             print(usage)
     else:
