@@ -45,6 +45,19 @@ DB_USER=postgres
 DB_PASSWORD=postgres
 ```
 
+## 多公众号管理
+
+在 `scraper.py` 顶部的 `SOURCES` 字典里添加公众号，每个 slug 可单独配置名称和单次运行的 API 额度：
+
+```python
+SOURCES = {
+    "pJMG8ZXFLd": {"name": "机器之心", "pages_per_run": 10},
+    "another_slug": {"name": "另一公众号", "pages_per_run": 5},
+}
+```
+
+不指定 slug 时，`--db fetch` / `--db scrape` 会遍历 `SOURCES` 中的所有公众号。
+
 ## 命令一览
 
 ### 文件模式（默认）
@@ -64,13 +77,17 @@ DB_PASSWORD=postgres
 
 | 命令 | 说明 |
 |------|------|
-| `python init_db.py` | 创建数据库表结构 |
+| `python init_db.py` | 创建数据库表结构（自动迁移旧表） |
 | `python init_db.py migrate` | 建表 + 将现有 JSONL 数据导入数据库 |
 | `python init_db.py migrate --images` | 建表 + 导入数据 + 导入本地图片到数据库 |
-| `python scraper.py --db fetch` | API 文章列表 → 数据库队列 |
-| `python scraper.py --db fetch 5` | 从第 5 页开始 |
-| `python scraper.py --db scrape` | 从数据库队列爬取正文 + 图片存入数据库 |
-| `python scraper.py --db status` | 查看数据库中的进度 |
+| `python init_db.py backfill` | 为已有文章回填 `content_text` 纯文本字段 |
+| `python scraper.py --db fetch` | 遍历 SOURCES 所有公众号，各自按 `pages_per_run` 限额抓取列表 |
+| `python scraper.py --db fetch pJMG8ZXFLd` | 仅抓取指定 slug |
+| `python scraper.py --db fetch pJMG8ZXFLd 5` | 指定 slug 从第 5 页开始 |
+| `python scraper.py --db scrape` | 从数据库队列爬取正文 + 图片（所有公众号） |
+| `python scraper.py --db scrape pJMG8ZXFLd` | 仅爬取指定 slug |
+| `python scraper.py --db status` | 查看所有公众号的进度 |
+| `python scraper.py --db status pJMG8ZXFLd` | 查看指定 slug 的进度 |
 | `python server.py --db` | 启动 Web 服务器（从数据库读取） |
 
 ## 数据库设计
@@ -118,7 +135,6 @@ data/
     "original_url": "http://mp.weixin.qq.com/s?...",
     "image": "原始封面图 URL",
     "image_local": "/data/images/{slug}/{id}/cover.jpg",
-    "is_first": 1,
     "content_html": "正文 HTML（图片链接已替换为本地路径）"
   },
   "meta": {
@@ -134,6 +150,8 @@ data/
 - **去重**：基于 `original_url` 自动跳过已抓取的文章（文件模式读集合，数据库模式用 UNIQUE 约束）
 - **断点续爬**：文件模式写进度文件，数据库模式用 `scrape_queue` + `scrape_progress` 表
 - **断点重连**：数据库模式支持连接池 + 自动重试，网络抖动不丢数据
+- **API 额度保护**：`pages_per_run` 限制每次运行消耗的翻页次数，多次运行逐步推进
+- **历史缺口检测**：遇到连续已有页时，若下一页从未抓过则继续探查，不会遗漏历史缺口
 - **API 限流保护**：API 返回异常时立即停止，不浪费请求次数
 - **微信反检测**：每篇文章间隔 3~6 秒随机延迟，携带完整浏览器 Headers
 - **连续失败熔断**：连续 5 次爬取失败自动中止
