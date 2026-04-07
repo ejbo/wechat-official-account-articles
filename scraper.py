@@ -41,7 +41,19 @@ if "--db" in sys.argv:
 # name        : 公众号名称（写入 sources 表，方便展示）
 # pages_per_run: 每次运行最多消耗的 API 翻页次数（额度保护）
 SOURCES = {
-    "pJMG8ZXFLd": {"name": "机器之心", "pages_per_run": 10},
+    "pJMG8ZXFLd": {"name": "机器之心", "pages_per_run": 100},
+    "BmcmLZE1td": {"name": "智东西", "pages_per_run": 300},
+    "fDZT3Q49Bk": {"name": "36氪", "pages_per_run": 100},
+    "SZa7lGats4": {"name": "Andy730", "pages_per_run": 300},
+    "tiKZRAcl3D": {"name": "新智元", "pages_per_run": 300},
+    "8LA3hF4EoQ": {"name": "量子位", "pages_per_run": 100},
+    "SaY55L9Ftq": {"name": "InfoQ", "pages_per_run": 300},
+    "Jw0FKj6ccg": {"name": "赛博禅心", "pages_per_run": 300},
+    "JihTVjLM5w": {"name": "芯东西", "pages_per_run": 300},
+    "euZCfLlKpL": {"name": "数字生命卡兹克", "pages_per_run": 300},
+    "fso2l9R6W4": {"name": "全球半导体观察", "pages_per_run": 300},
+    "nGqairAU3Z": {"name": "晚点LatePost", "pages_per_run": 300},
+
     # "another_slug": {"name": "另一公众号", "pages_per_run": 5},
 }
 # 单 slug 兼容旧命令（取第一个，或从 .env 指定）
