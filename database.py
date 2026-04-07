@@ -104,7 +104,6 @@ CREATE TABLE IF NOT EXISTS scrape_queue (
     author          VARCHAR(255) NOT NULL DEFAULT '',
     publish_time    VARCHAR(32)  NOT NULL DEFAULT '',
     cover_url       TEXT         NOT NULL DEFAULT '',
-    is_first        SMALLINT     NOT NULL DEFAULT 0,
     raw_meta        JSONB,                                -- API 返回的原始 JSON，保留完整信息
     status          VARCHAR(16)  NOT NULL DEFAULT 'pending',  -- pending | processing | done | failed
     retry_count     INTEGER      NOT NULL DEFAULT 0,
@@ -367,14 +366,14 @@ def get_articles(db, source_id=None, limit=100, offset=0):
             if source_id:
                 cur.execute("""
                     SELECT id, source_id, article_hash, title, author, publish_time,
-                           original_url, cover_url, content_html, is_first, fetched_at
+                           original_url, cover_url, content_html, fetched_at
                     FROM articles WHERE source_id = %s
                     ORDER BY fetched_at DESC LIMIT %s OFFSET %s
                 """, (source_id, limit, offset))
             else:
                 cur.execute("""
                     SELECT id, source_id, article_hash, title, author, publish_time,
-                           original_url, cover_url, content_html, is_first, fetched_at
+                           original_url, cover_url, content_html, fetched_at
                     FROM articles
                     ORDER BY fetched_at DESC LIMIT %s OFFSET %s
                 """, (limit, offset))
@@ -460,8 +459,8 @@ def enqueue_articles(db, source_id, items):
                     cur.execute("""
                         INSERT INTO scrape_queue
                             (source_id, original_url, title, author, publish_time,
-                             cover_url, is_first, raw_meta)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                             cover_url, raw_meta)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (source_id, original_url) DO NOTHING
                     """, (
                         source_id,
@@ -470,7 +469,6 @@ def enqueue_articles(db, source_id, items):
                         item.get("author", ""),
                         item.get("publish_time", ""),
                         item.get("image", ""),
-                        item.get("is_first", 0),
                         psycopg2.extras.Json(item),
                     ))
                     if cur.rowcount > 0:

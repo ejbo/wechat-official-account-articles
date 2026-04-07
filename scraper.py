@@ -447,7 +447,6 @@ def build_record(item, content_html, local_cover, slug, art_id):
             "original_url": item.get("original_url", ""),
             "image": item.get("image", ""),
             "image_local": local_cover,
-            "is_first": item.get("is_first", 0),
             "content_html": content_html,
         },
         "meta": {
